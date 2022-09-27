@@ -1,9 +1,9 @@
 [package]
-name = "eframe_template"
+name = "pixelite"
 version = "0.1.0"
-authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]
+authors = ["azcutei <aiz.cutei@gmail.com>"]
 edition = "2021"
-rust-version = "1.60"
+rust-version = "1.64"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
