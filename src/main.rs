@@ -7,11 +7,15 @@ fn main() {
     // Log to stdout (if you run with `RUST_LOG=debug`).
     tracing_subscriber::fmt::init();
 
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        follow_system_theme: true,
+        drag_and_drop_support: true,
+        ..Default::default()
+    };
     eframe::run_native(
         "pixelite",
         native_options,
-        Box::new(|cc| Box::new(pixelite::TemplateApp::new(cc))),
+        Box::new(|cc| Box::new(pixelite::PixeliteApp::new(cc))),
     );
 }
 
@@ -24,11 +28,14 @@ fn main() {
     // Redirect tracing to console.log and friends:
     tracing_wasm::set_as_global_default();
 
-    let web_options = eframe::WebOptions::default();
+    let web_options = eframe::WebOptions {
+        follow_system_theme: true,
+        ..Default::default()
+    };
     eframe::start_web(
         "the_canvas_id", // hardcode it
         web_options,
-        Box::new(|cc| Box::new(pixelite::TemplateApp::new(cc))),
+        Box::new(|cc| Box::new(pixelite::PixeliteApp::new(cc))),
     )
     .expect("failed to start eframe");
 }

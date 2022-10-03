@@ -1,36 +1,44 @@
+use eframe::egui;
+use egui_extras::image::RetainedImage;
+use egui_extras::StripBuilder;
+use std::future::Future;
+use std::io;
+use std::path::PathBuf;
+
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
-pub struct TemplateApp {
+pub struct PixeliteApp {
+    open_file_path: Option<PathBuf>,
     // Example stuff:
-    label: String,
     setting_window: bool,
     input_window: bool,
     output_window: bool,
-
     // this how you opt-out of serialization of a member
     #[serde(skip)]
-    value: f32,
+    pixel_size: i32,
+    color_distortion: i32,
 
     #[serde(skip)]
-    texture: Option<egui::TextureHandle>,
+    image: Option<RetainedImage>,
 }
 
-impl Default for TemplateApp {
+impl Default for PixeliteApp {
     fn default() -> Self {
         Self {
             // Example stuff:
-            label: "Hello World!".to_owned(),
-            value: 2.7,
+            open_file_path: None,
+            pixel_size: 16,
+            color_distortion: 5,
             setting_window: true,
             input_window: true,
             output_window: true,
-            texture: None,
+            image: None,
         }
     }
 }
 
-impl TemplateApp {
+impl PixeliteApp {
     /// Called once before the first frame.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // This is also where you can customized the look at feel of egui using
@@ -46,7 +54,7 @@ impl TemplateApp {
     }
 }
 
-impl eframe::App for TemplateApp {
+impl eframe::App for PixeliteApp {
     /// Called by the frame work to save state before shutdown.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
@@ -54,14 +62,15 @@ impl eframe::App for TemplateApp {
 
     /// Called each time the UI needs repainting, which may be many times per second.
     /// Put your widgets into a `SidePanel`, `TopPanel`, `CentralPanel`, `Window` or `Area`.
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let Self {
-            label,
+            open_file_path,
+            pixel_size,
+            color_distortion,
             setting_window,
             input_window,
             output_window,
-            value,
-            texture,
+            image,
         } = self;
 
         // Examples of how to create different panels and windows.
@@ -83,7 +92,7 @@ impl eframe::App for TemplateApp {
 
                     #[cfg(not(target_arch = "wasm32"))] // no File->Quit on web pages!
                     if ui.button("Quit").clicked() {
-                        _frame.close();
+                        frame.close();
                     }
                 });
                 ui.menu_button("Window", |ui| {
@@ -103,15 +112,35 @@ impl eframe::App for TemplateApp {
         if *setting_window {
             egui::SidePanel::left("side_panel").show(ctx, |ui| {
                 ui.heading("Setting Panel");
+                ui.separator();
 
+                ui.label("Load a  picture:");
+                if ui.button("Open").clicked() {
+                    *open_file_path = choose_file(frame);
+                    let file_bytes = std::fs::read(open_file_path.as_ref().unwrap()).unwrap();
+
+                    self.image =
+                        Some(RetainedImage::from_image_bytes("process", &file_bytes).unwrap());
+                }
+
+                ui.label("Pixel Size: ");
                 ui.horizontal(|ui| {
-                    ui.label("Write something: ");
-                    ui.text_edit_singleline(label);
+                    ui.selectable_value(pixel_size, 16, "16 * 16");
+                    ui.selectable_value(pixel_size, 32, "32 * 32");
+                    ui.selectable_value(pixel_size, 64, "64 * 64");
+                    ui.selectable_value(pixel_size, 128, "128 * 128");
+                    ui.selectable_value(pixel_size, 256, "256 * 256");
                 });
+                ui.end_row();
 
-                ui.add(egui::Slider::new(value, 0.0..=10.0).text("value"));
-                if ui.button("Increment").clicked() {
-                    *value += 1.0;
+                ui.label("Color distortion: ");
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(color_distortion, 0..=10));
+                });
+                ui.end_row();
+
+                if ui.button("Generate").clicked() {
+                    *output_window = true;
                 }
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -127,18 +156,45 @@ impl eframe::App for TemplateApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if *input_window {
-                egui::Window::new("Input Image").show(ctx, |ui| {
-                    ui.label("This is a window");
+                egui::Window::new("Input").show(ctx, |ui| {
+                    if let Some(image) = &self.image {
+                        image.show(ui);
+                    }
                     egui::warn_if_debug_build(ui);
                 });
             }
 
             if *output_window {
                 egui::Window::new("Output Image").show(ctx, |ui| {
-                    ui.label("This is a window");
+                    ui.label("No output image yet. Click Generate to generate one.");
                     egui::warn_if_debug_build(ui);
                 });
             }
         });
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn choose_file(frame: &mut eframe::Frame) -> Option<PathBuf> {
+    let task = rfd::AsyncFileDialog::new().pick_file();
+    execute(async move {
+        let file = task.await;
+        return file;
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn choose_file(frame: &mut eframe::Frame) -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_file()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn execute<F: Future<Output = ()> + Send + 'static>(f: F) {
+    // this is stupid... use any executor of your choice instead
+    std::thread::spawn(move || futures::executor::block_on(f));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute<F: Future<Output = ()> + 'static>(f: F) {
+    wasm_bindgen_futures::spawn_local(f);
 }
