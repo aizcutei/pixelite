@@ -1,8 +1,14 @@
 use eframe::egui;
 use egui_extras::image::RetainedImage;
-use std::future::Future;
+#[cfg(target_arch = "wasm32")]
+use futures::Future;
+use image::{codecs::png::PngEncoder, DynamicImage, ImageEncoder};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+
+use crate::util::{self, dynamic_image_to_color_image, KmeansParams};
+
+const DEBUG: bool = false;
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -20,6 +26,7 @@ pub struct PixeliteApp {
     dropped_file: Option<egui::DroppedFile>,
 
     information: String,
+    dbg_information: String,
 
     setting_window: bool,
     input_window: bool,
@@ -28,13 +35,28 @@ pub struct PixeliteApp {
     color_palette_window: bool,
     is_loading: bool,
 
-    pixel_size: i32,
-    color_distortion: i32,
+    pixel_size: usize,
 
-    raw_image: Option<Vec<u8>>,
+    raw_input: Option<Vec<u8>>,
+    raw_output: Option<Vec<u8>>,
+
+    #[serde(skip)]
+    img_dyn: Option<DynamicImage>,
+
+    #[serde(skip)]
+    output_img_dyn: Option<DynamicImage>,
+
+    #[serde(skip)]
+    color_palette: Option<Vec<egui::Color32>>,
 
     #[serde(skip)]
     image: Option<RetainedImage>,
+
+    #[serde(skip)]
+    output_image: Option<RetainedImage>,
+
+    #[serde(skip)]
+    kmeans_params: KmeansParams,
 }
 
 impl Default for PixeliteApp {
@@ -44,6 +66,7 @@ impl Default for PixeliteApp {
             dropped_files: Default::default(),
             dropped_file: None,
             information: String::new(),
+            dbg_information: String::new(),
             setting_window: true,
             input_window: true,
             output_window: true,
@@ -51,9 +74,21 @@ impl Default for PixeliteApp {
             color_palette_window: false,
             is_loading: false,
             pixel_size: 16,
-            color_distortion: 5,
-            raw_image: None,
+            raw_input: None,
+            raw_output: None,
+            img_dyn: None,
+            output_img_dyn: None,
+            color_palette: None,
             image: None,
+            output_image: None,
+            kmeans_params: KmeansParams {
+                k: 5,
+                run: 10,
+                max_iter: 20,
+                converge: 1.0,
+                verbose: false,
+                seed: 0,
+            },
         }
     }
 }
@@ -88,16 +123,22 @@ impl eframe::App for PixeliteApp {
             dropped_file,
             open_file_path,
             information,
+            dbg_information,
             pixel_size,
-            color_distortion,
             setting_window,
             input_window,
             output_window,
             info_window,
             color_palette_window,
             is_loading,
-            raw_image,
+            raw_input,
+            raw_output,
+            img_dyn,
+            output_img_dyn,
+            color_palette,
             image,
+            output_image,
+            kmeans_params,
         } = self;
 
         // Examples of how to create different panels and windows.
@@ -113,14 +154,35 @@ impl eframe::App for PixeliteApp {
                     #[cfg(not(target_arch = "wasm32"))]
                     if ui.button("Open").clicked() {
                         self.open_file_path = choose_file(frame);
-                        let file_bytes =
-                            std::fs::read(self.open_file_path.as_ref().unwrap()).unwrap();
-                        self.raw_image = Some(file_bytes.clone());
+                        let file_bytes = std::fs::read(self.open_file_path.as_ref().unwrap())
+                            .unwrap_or_default();
+                        self.raw_input = Some(file_bytes.clone());
                         self.image =
                             Some(RetainedImage::from_image_bytes("process", &file_bytes).unwrap());
                     }
                     if ui.button("Save as").clicked() {
-                        todo!()
+                        if self.raw_output.is_some() {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let save = rfd::FileDialog::new()
+                                    .set_file_name("output.png")
+                                    .save_file();
+                                if let Some(path) = save {
+                                    let mut file = std::fs::File::create(path).unwrap();
+                                    let mut encoder = PngEncoder::new(&mut file);
+                                    encoder
+                                        .write_image(
+                                            self.raw_output.as_ref().unwrap(),
+                                            self.output_img_dyn.as_ref().unwrap().width(),
+                                            self.output_img_dyn.as_ref().unwrap().height(),
+                                            image::ColorType::Rgb8,
+                                        )
+                                        .unwrap();
+                                }
+                            }
+                        } else {
+                            *information = "No output to save".to_string();
+                        }
                     }
 
                     #[cfg(not(target_arch = "wasm32"))] // no File->Quit on web pages!
@@ -148,7 +210,7 @@ impl eframe::App for PixeliteApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ctx, |_ui| {
             if self.setting_window {
                 egui::Window::new("Setting").show(ctx, |ui| {
                     ui.heading("Setting Panel");
@@ -164,7 +226,9 @@ impl eframe::App for PixeliteApp {
                                     let file_bytes =
                                         std::fs::read(self.open_file_path.as_ref().unwrap())
                                             .unwrap();
-                                    self.raw_image = Some(file_bytes.clone());
+                                    self.raw_input = Some(file_bytes.clone());
+                                    self.img_dyn =
+                                        Some(image::load_from_memory(&file_bytes).unwrap());
                                     self.image = Some(
                                         RetainedImage::from_image_bytes("process", &file_bytes)
                                             .unwrap(),
@@ -184,29 +248,97 @@ impl eframe::App for PixeliteApp {
                             }
                         }
                     });
-                    if self.is_loading {
-                        ui.label("Loading...");
-                        ui.add(egui::Spinner::new());
-                    }
 
                     ui.label("Pixel Size: ");
                     ui.horizontal(|ui| {
-                        ui.selectable_value(pixel_size, 16, "16 * 16");
-                        ui.selectable_value(pixel_size, 32, "32 * 32");
-                        ui.selectable_value(pixel_size, 64, "64 * 64");
-                        ui.selectable_value(pixel_size, 128, "128 * 128");
-                        ui.selectable_value(pixel_size, 256, "256 * 256");
+                        ui.selectable_value(pixel_size, 4, "4");
+                        ui.selectable_value(pixel_size, 8, "8");
+                        ui.selectable_value(pixel_size, 16, "16");
+                        ui.selectable_value(pixel_size, 32, "32");
+                        ui.selectable_value(pixel_size, 64, "64");
+                        ui.selectable_value(pixel_size, 128, "128");
+
+                        ui.add(
+                            egui::DragValue::new(pixel_size)
+                                .speed(1.0)
+                                .clamp_range(1..=2048),
+                        );
                     });
                     ui.end_row();
 
                     ui.label("Color distortion: ");
                     ui.horizontal(|ui| {
-                        ui.add(egui::Slider::new(color_distortion, 0..=10));
+                        ui.add(egui::Slider::new(&mut kmeans_params.k, 2..=20));
                     });
                     ui.end_row();
 
+                    ui.collapsing("Advanced", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Runs: ");
+                            ui.add(egui::DragValue::new(&mut kmeans_params.run).speed(1.0));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Iterations: ");
+                            ui.add(egui::DragValue::new(&mut kmeans_params.max_iter).speed(1.0));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Converge");
+                            ui.add(egui::DragValue::new(&mut kmeans_params.converge).speed(1.0));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Seed: ");
+                            ui.add(egui::DragValue::new(&mut kmeans_params.seed).speed(1.0));
+                        });
+                    });
+
                     if ui.button("Generate").clicked() {
-                        self.output_window = true;
+                        if self.img_dyn.is_some() {
+                            let (rgb_palette, lab_palette) = util::calculate_kmeans(
+                                self.img_dyn.as_ref().unwrap().clone(),
+                                *kmeans_params,
+                            )
+                            .unwrap();
+                            self.color_palette = Some(rgb_palette);
+
+                            let output_size = util::calc_target_size(
+                                self.img_dyn.as_ref().unwrap().clone(),
+                                *pixel_size,
+                            );
+                            if output_size.is_none() {
+                                self.information = "Pixel size is too large".to_string();
+                            } else {
+                                //let sharpened_img =
+                                //    util::sharpen_filter(self.img_dyn.as_ref().unwrap().clone());
+
+                                let output_img = util::generate_image(
+                                    self.img_dyn.as_ref().unwrap().clone(),
+                                    //sharpened_img,
+                                    *pixel_size,
+                                    output_size.unwrap(),
+                                    lab_palette,
+                                );
+                                self.output_img_dyn = Some(output_img.clone());
+                                self.raw_output = Some(output_img.to_rgb8().to_vec());
+
+                                self.output_image = Some(RetainedImage::from_color_image(
+                                    "output",
+                                    dynamic_image_to_color_image(output_img),
+                                ));
+                            }
+
+                            self.color_palette_window = true;
+                            self.output_window = true;
+                        } else {
+                            self.information = "Please load a picture first!".to_string();
+                        }
+                    }
+
+                    if self.is_loading {
+                        ui.label("Loading...");
+                        ui.add(egui::Spinner::new());
                     }
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -221,28 +353,32 @@ impl eframe::App for PixeliteApp {
             }
 
             if self.input_window {
-                egui::Window::new("Input").show(ctx, |ui| {
-                    if let Some(image) = &self.image {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let window_size = frame.info().window_info.size;
+                egui::Window::new("Input Image")
+                    .vscroll(true)
+                    .hscroll(true)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        if let Some(image) = &self.image {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let window_size = frame.info().window_info.size;
 
-                        #[cfg(target_arch = "wasm32")]
-                        let window_size = egui::vec2(1080.0, 1920.0);
-                        let image_size = image.size_vec2();
-                        if image_size.x / window_size.x > image_size.y / window_size.y {
-                            let scale = window_size.x / (2.0 * image_size.x);
-                            image.show_scaled(ui, scale);
+                            #[cfg(target_arch = "wasm32")]
+                            let window_size = egui::vec2(1080.0, 720.0);
+                            let image_size = image.size_vec2();
+                            if image_size.x / window_size.x > image_size.y / window_size.y {
+                                let scale = window_size.x / (2.0 * image_size.x);
+                                image.show_scaled(ui, scale);
+                            } else {
+                                let scale = window_size.y / (2.0 * image_size.y);
+                                image.show_scaled(ui, scale);
+                            }
+
+                            self.is_loading = false;
                         } else {
-                            let scale = window_size.y / (2.0 * image_size.y);
-                            image.show_scaled(ui, scale);
+                            ui.label("No image loaded, drag in a image to start.");
                         }
-
-                        self.is_loading = false;
-                    } else {
-                        ui.label("No image loaded, drag in a image to start.");
-                    }
-                    egui::warn_if_debug_build(ui);
-                });
+                        egui::warn_if_debug_build(ui);
+                    });
             }
 
             if self.output_window {
@@ -251,43 +387,59 @@ impl eframe::App for PixeliteApp {
                     .hscroll(true)
                     .resizable(true)
                     .show(ctx, |ui| {
-                        ui.label("No output image yet. Click Generate to generate one.");
+                        if let Some(image) = &self.output_image {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let window_size = frame.info().window_info.size;
+
+                            #[cfg(target_arch = "wasm32")]
+                            let window_size = egui::vec2(1080.0, 720.0);
+                            let image_size = image.size_vec2();
+                            if image_size.x / window_size.x > image_size.y / window_size.y {
+                                let scale = window_size.x / (4.0 * image_size.x);
+                                image.show_scaled(ui, scale);
+                            } else {
+                                let scale = window_size.y / (4.0 * image_size.y);
+                                image.show_scaled(ui, scale);
+                            }
+                        } else {
+                            ui.label("No output image yet. Click Generate to generate one.");
+                        }
                         egui::warn_if_debug_build(ui);
                     });
             }
 
-            if self.info_window {
-                egui::Window::new("Warning!").show(ctx, |ui| {
-                    ui.heading(self.information.clone());
-                    if ui.button("OK").clicked() {
-                        self.info_window = false;
-                    }
-                });
-            }
+            if self.info_window {}
 
             if self.color_palette_window {
                 egui::Window::new("Color Palette").show(ctx, |ui| {
-                    ui.label("No color palette yet. Click Generate to generate one.");
+                    if self.color_palette.is_none() {
+                        ui.label("No color palette yet. Click Generate to generate one.");
+                    } else {
+                        ui.horizontal(|ui| {
+                            for color in self.color_palette.as_ref().unwrap() {
+                                let mut c = *color;
+                                ui.color_edit_button_srgba(&mut c);
+                            }
+                        });
+                    }
+
                     egui::warn_if_debug_build(ui);
                 });
             }
-            /*
-            if !self.dropped_files.is_empty() {
+
+            // Debug Window
+            if DEBUG {
                 egui::Window::new("debug").show(ctx, |ui| {
                     ui.group(|ui| {
-                        if !self.dropped_files.is_empty() {
-                            for file in &self.dropped_files {
-                                ui.label(format!("  {:?}", file));
-                            }
-                        }
+                        ui.label(self.dbg_information.clone());
                     });
                 });
             }
-            */
 
             preview_files_being_dropped(ctx);
         });
 
+        //Drag & Drop related
         if !ctx.input().raw.dropped_files.is_empty() {
             self.dropped_files = ctx.input().raw.dropped_files.clone();
             if !self.dropped_files.is_empty() {
@@ -345,9 +497,10 @@ impl eframe::App for PixeliteApp {
                 {
                     let file_copy = self.dropped_files.last().cloned();
                     self.open_file_path = file_copy.unwrap().path;
-                    if let Some(path) = &self.open_file_path {
+                    if let Some(path) = self.open_file_path.as_ref() {
                         let file_bytes = std::fs::read(path).unwrap();
-                        self.raw_image = Some(file_bytes.clone());
+                        self.raw_input = Some(file_bytes.clone());
+                        self.img_dyn = Some(image::load_from_memory(&file_bytes).unwrap());
                         self.image =
                             Some(RetainedImage::from_image_bytes("process", &file_bytes).unwrap());
                     }
@@ -358,7 +511,8 @@ impl eframe::App for PixeliteApp {
                     self.open_file_path = Some(self.dropped_file.as_ref().unwrap().name.clone());
                     let file_copy = self.dropped_files.last().cloned();
                     let raw_bytes = file_copy.unwrap().bytes.unwrap().clone();
-                    self.raw_image = Some(raw_bytes.to_vec().clone());
+                    self.raw_input = Some(raw_bytes.to_vec().clone());
+                    self.img_dyn = Some(image::load_from_memory(&raw_bytes).unwrap());
                     self.image =
                         Some(RetainedImage::from_image_bytes("process", &raw_bytes).unwrap());
                 }
@@ -399,7 +553,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn choose_file(frame: &mut eframe::Frame) -> Option<PathBuf> {
+fn choose_file(_frame: &mut eframe::Frame) -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter(
             "image",
@@ -408,11 +562,13 @@ fn choose_file(frame: &mut eframe::Frame) -> Option<PathBuf> {
         .pick_file()
 }
 
+/*
 #[cfg(not(target_arch = "wasm32"))]
 fn execute<F: Future<Output = ()> + Send + 'static>(f: F) {
     // this is stupid... use any executor of your choice instead
     std::thread::spawn(move || futures::executor::block_on(f));
 }
+*/
 
 #[cfg(target_arch = "wasm32")]
 fn execute<F: Future<Output = ()> + 'static>(f: F) {
@@ -422,16 +578,11 @@ fn execute<F: Future<Output = ()> + 'static>(f: F) {
 #[cfg(target_arch = "wasm32")]
 fn choose_file(frame: &mut eframe::Frame) {
     let task = rfd::AsyncFileDialog::new().pick_file();
-    //let content = Arc::new(Mutex::new(Vec::<u8>::new()));
-    //let content_clone = content.clone();
+
     execute(async move {
         let file = task.await;
-        //let mut ct = content_clone.lock().unwrap();
         if let Some(file) = file {
             let f = file.read().await;
-            //ct.extend_from_slice(&f);
         }
     });
-    //let x = content.lock().unwrap().clone();
-    //x
 }
