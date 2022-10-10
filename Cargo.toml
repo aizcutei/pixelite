@@ -19,6 +19,7 @@ rfd = "0.10.0"
 futures = "0.3.24"
 palette = "0.6"
 egui-toast = "0.4.0"
+imageproc = "0.23.0"
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
